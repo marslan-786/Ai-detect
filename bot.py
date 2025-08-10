@@ -2,7 +2,7 @@ import os
 import io
 import zipfile
 import json
-import requests
+import aiohttp
 from telegram import Update, Chat
 from telegram.ext import (
     Application,
@@ -43,20 +43,20 @@ def analyze_illegal_message(text: str) -> bool:
     text_lower = text.lower()
     return any(k in text_lower for k in keywords)
 
-def analyze_with_api(text: str) -> bool:
-    try:
-        response = requests.get(API_URL, params={"prompt": text}, timeout=API_TIMEOUT)
-        data = response.json()
-        # صرف status چیک کرے گا
-        return bool(data.get("status", False))
-    except Exception:
-        return False
+async def analyze_with_api(text: str) -> bool:
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(API_URL, params={"prompt": text}, timeout=API_TIMEOUT) as resp:
+                data = await resp.json()
+                # صرف status چیک کرے گا
+                return bool(data.get("status", False))
+        except Exception:
+            return False
 
 def append_rules(chat_id: int, new_rule: str):
     rules_data = load_rules(chat_id)
     old_rules = rules_data.get("rules", "")
     if old_rules:
-        # پہلے والے رولز کے ساتھ نیا رول شامل کر دو، new line کے ساتھ
         updated_rules = old_rules + "\n" + new_rule
     else:
         updated_rules = new_rule
@@ -71,11 +71,9 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     chat = message.chat
     user = message.from_user
 
-    # اگر sender admin ہے تو چیک نہ کریں
     if await is_user_admin(chat, user.id, context):
         return
 
-    # اگر میسج میں لنک یا مینشن ہے یا فارورڈڈ ہے تو فوراً ایکشن کریں
     if message.entities:
         for ent in message.entities:
             if ent.type in ['url', 'mention', 'text_mention']:
@@ -85,10 +83,10 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await message.reply_text("/action", reply_to_message_id=message.message_id)
         return
 
-    # رولز چیک کریں
     rules = load_rules(chat.id)
     if rules:
-        if analyze_illegal_message(message.text) or analyze_with_api(message.text):
+        # اب async API call استعمال کریں
+        if analyze_illegal_message(message.text) or await analyze_with_api(message.text):
             await message.reply_text("/action", reply_to_message_id=message.message_id)
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -127,17 +125,14 @@ async def setrules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Bot must be admin in the group to save rules.")
         return
 
-    # پہلے سے موجود رولز لوڈ کریں
     existing_rules_data = load_rules(chat.id)
     existing_rules = existing_rules_data.get("rules", "")
 
-    # اگر رولز پہلے سے موجود ہیں تو نئے رول کو نئی لائن کے ساتھ جوڑ دیں
     if existing_rules:
         updated_rules = existing_rules + "\n" + rules_text
     else:
         updated_rules = rules_text
 
-    # اپڈیٹڈ رولز کو سیو کریں
     save_rules(chat.id, {"rules": updated_rules})
 
     await message.reply_text(f"Rules updated for group {chat.title}.")
@@ -153,12 +148,13 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         await message.reply_text("Unknown command. Use /start or /setrules.")
         return
 
-    try:
-        response = requests.get(API_URL, params={"prompt": text}, timeout=API_TIMEOUT)
-        data = response.json()
-        ai_reply = data.get("reply", "I couldn't understand that.")  # ← reply فیلڈ
-    except Exception as e:
-        ai_reply = f"Error: {e}"
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(API_URL, params={"prompt": text}, timeout=API_TIMEOUT) as resp:
+                data = await resp.json()
+                ai_reply = data.get("reply", "I couldn't understand that.")
+        except Exception as e:
+            ai_reply = f"Error: {e}"
 
     await message.reply_text(ai_reply)
 
@@ -169,19 +165,17 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Backup command only works in private chat.")
         return
 
-    rules_folder = RULES_FOLDER  # group_rules فولڈر
-    bot_file = "bot.py"  # بوٹ ڈاٹ پی فائل
+    rules_folder = RULES_FOLDER
+    bot_file = "bot.py"
 
     mem_zip = io.BytesIO()
     with zipfile.ZipFile(mem_zip, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        # group_rules فولڈر کی فائلز شامل کریں
         for root, dirs, files in os.walk(rules_folder):
             for file in files:
                 filepath = os.path.join(root, file)
                 arcname = os.path.relpath(filepath, start=os.path.dirname(rules_folder))
                 zf.write(filepath, arcname)
 
-        # bot.py فائل شامل کریں اگر موجود ہو
         if os.path.isfile(bot_file):
             zf.write(bot_file, arcname=os.path.basename(bot_file))
 
@@ -189,7 +183,7 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_document(document=mem_zip, filename="backup.zip", caption="Here's your backup.")
 
 async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
-    print(f"Error occurred: {context.error}")  # Error details console میں آئے گا
+    print(f"Error occurred: {context.error}")
     if update and update.effective_message:
         await update.effective_message.reply_text("Sorry! Something went wrong. Please try again.")
 
