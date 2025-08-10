@@ -49,6 +49,17 @@ def analyze_with_api(text: str) -> bool:
     except Exception:
         return False
 
+def append_rules(chat_id: int, new_rule: str):
+    rules_data = load_rules(chat_id)
+    old_rules = rules_data.get("rules", "")
+    if old_rules:
+        # پہلے والے رولز کے ساتھ نیا رول شامل کر دو، new line کے ساتھ
+        updated_rules = old_rules + "\n" + new_rule
+    else:
+        updated_rules = new_rule
+    rules_data["rules"] = updated_rules
+    save_rules(chat_id, rules_data)
+
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.text:
@@ -113,8 +124,20 @@ async def setrules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Bot must be admin in the group to save rules.")
         return
 
-    save_rules(chat.id, {"rules": rules_text})
-    await message.reply_text(f"Rules saved for group {chat.title}.")
+    # پہلے سے موجود رولز لوڈ کریں
+    existing_rules_data = load_rules(chat.id)
+    existing_rules = existing_rules_data.get("rules", "")
+
+    # اگر رولز پہلے سے موجود ہیں تو نئے رول کو نئی لائن کے ساتھ جوڑ دیں
+    if existing_rules:
+        updated_rules = existing_rules + "\n" + rules_text
+    else:
+        updated_rules = rules_text
+
+    # اپڈیٹڈ رولز کو سیو کریں
+    save_rules(chat.id, {"rules": updated_rules})
+
+    await message.reply_text(f"Rules updated for group {chat.title}.")
 
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -137,6 +160,32 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
 
     await message.reply_text(ai_reply)
 
+async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+
+    if update.effective_chat.type != 'private':
+        await message.reply_text("Backup command only works in private chat.")
+        return
+
+    rules_folder = RULES_FOLDER  # group_rules فولڈر
+    bot_file = "bot.py"  # بوٹ ڈاٹ پی فائل
+
+    mem_zip = io.BytesIO()
+    with zipfile.ZipFile(mem_zip, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        # group_rules فولڈر کی فائلز شامل کریں
+        for root, dirs, files in os.walk(rules_folder):
+            for file in files:
+                filepath = os.path.join(root, file)
+                arcname = os.path.relpath(filepath, start=os.path.dirname(rules_folder))
+                zf.write(filepath, arcname)
+
+        # bot.py فائل شامل کریں اگر موجود ہو
+        if os.path.isfile(bot_file):
+            zf.write(bot_file, arcname=os.path.basename(bot_file))
+
+    mem_zip.seek(0)
+    await message.reply_document(document=mem_zip, filename="backup.zip", caption="Here's your backup.")
+
 def main():
     application = Application.builder() \
         .token(BOT_TOKEN) \
@@ -149,6 +198,7 @@ def main():
 
     application.add_handler(CommandHandler("start", start_command, filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("setrules", setrules_command, filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("backup", backup_command, filters.ChatType.PRIVATE))
 
     application.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
