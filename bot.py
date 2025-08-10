@@ -47,7 +47,8 @@ def analyze_with_api(text: str) -> bool:
     try:
         response = requests.get(API_URL, params={"prompt": text}, timeout=API_TIMEOUT)
         data = response.json()
-        return data.get("status", False)
+        # صرف status چیک کرے گا
+        return bool(data.get("status", False))
     except Exception:
         return False
 
@@ -148,7 +149,6 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
 
     text = message.text.strip()
 
-    # اگر میسج کمانڈ نہ ہو تو AI سے جواب لو
     if text.startswith("/"):
         await message.reply_text("Unknown command. Use /start or /setrules.")
         return
@@ -156,7 +156,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     try:
         response = requests.get(API_URL, params={"prompt": text}, timeout=API_TIMEOUT)
         data = response.json()
-        ai_reply = data.get("result", "I couldn't understand that.")
+        ai_reply = data.get("reply", "I couldn't understand that.")  # ← reply فیلڈ
     except Exception as e:
         ai_reply = f"Error: {e}"
 
@@ -188,6 +188,11 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mem_zip.seek(0)
     await message.reply_document(document=mem_zip, filename="backup.zip", caption="Here's your backup.")
 
+async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    print(f"Error occurred: {context.error}")  # Error details console میں آئے گا
+    if update and update.effective_message:
+        await update.effective_message.reply_text("Sorry! Something went wrong. Please try again.")
+
 def main():
     application = Application.builder() \
         .token(BOT_TOKEN) \
@@ -201,6 +206,7 @@ def main():
     application.add_handler(CommandHandler("start", start_command, filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("setrules", setrules_command, filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("backup", backup_command, filters.ChatType.PRIVATE))
+    application.add_error_handler(error_handler)
 
     application.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
