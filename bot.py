@@ -10,12 +10,10 @@ from telegram.ext import (
     filters
 )
 
-# Increased timeout for API requests
 API_TIMEOUT = 10
 API_URL = "https://gpt-3-5.apis-bj-devs.workers.dev/"
 BOT_TOKEN = "7405849363:AAH3-6QuSUb2bJvTkpWfqoSlVKeYn-ERfpo"
 
-# فولڈر جہاں گروپ رولز فائلز سیو ہوں گی
 RULES_FOLDER = "group_rules"
 os.makedirs(RULES_FOLDER, exist_ok=True)
 
@@ -48,25 +46,21 @@ def analyze_with_api(text: str):
         response = requests.get(API_URL, params={"prompt": text}, timeout=API_TIMEOUT)
         data = response.json()
         return data.get("status", False)
-    except Exception as e:
-        print("API error:", e)
+    except Exception:
         return False
 
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message:
         return
-        
+
     chat = message.chat
     user = message.from_user
 
-    # اگر sender ایڈمن ہے تو ignore کریں
     if await is_user_admin(chat, user.id, context):
         return
 
-    # اگر میسج لنک، مینشن یا فارورڈڈ ہے تو فوراً ایکشن دے دیں
     if message.entities or message.forward_date:
-        # entities میں لنک یا مینشن چیک کریں
         for ent in message.entities or []:
             if ent.type in ['url', 'mention', 'text_mention']:
                 await message.reply_text("/action", reply_to_message_id=message.message_id)
@@ -75,21 +69,10 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await message.reply_text("/action", reply_to_message_id=message.message_id)
             return
 
-    # باقی میسجز کا AI سے اینالائز کریں
     rules = load_rules(chat.id)
-
-    # اگر رولز موجود ہیں تو ان کی بنیاد پر چیک کریں
     if rules:
-        # سادہ کی ورڈ چیک (آپ API call بھی لگا سکتے ہیں)
         if analyze_illegal_message(message.text or "") or analyze_with_api(message.text or ""):
             await message.reply_text("/action", reply_to_message_id=message.message_id)
-
-async def post_init(application: Application):
-    await application.bot.set_my_commands([
-        ("setrules", "Set group rules"),
-    ])
-    
-from langdetect import detect
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -103,7 +86,6 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
 
     text = message.text or ""
 
-    # اگر کمانڈ ہے تو اسے الگ ہینڈل کریں
     if text.startswith("/setrules"):
         parts = text.split(None, 2)
         if len(parts) < 3:
@@ -135,19 +117,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         await message.reply_text(f"Rules saved for group {chat.title}.")
         return
 
-    # اسکرپٹ یا بہت لمبا/مشکل ٹیکسٹ چیک کرنے سے پہلے، جو صرف عام چیٹ ہو
-    if "\n" in text and len(text.split("\n")) > 5:
-        # زیادہ ایموجیز یا خاص کریکٹر چیک (بس سیمپل چیک)
-        emoji_count = sum(1 for c in text if c in "😀😂🤣😍👍🙏👎😢😡😱🔥✨")  # اپنی مرضی کے ایموجی بڑھا سکتے ہو
-        if emoji_count > 10:
-            await message.reply_text("Your message contains too many emojis. Please send simpler text.")
-            return
-        # اگر لگتا ہے کہ یہ سکرپٹ یا پیچیدہ ہے تو ہلکا سا پیغام دیں
-        if any(sym in text for sym in ["{", "}", ";", "=", "(", ")"]):
-            await message.reply_text("I cannot process scripts or complex text. Please chat normally.")
-            return
-
-    # باقی نارمل چیٹ کا جواب AI سے لیں
+    # باقی عام چیٹ کا جواب AI سے لیں
     try:
         response = requests.get(API_URL, params={"prompt": text}, timeout=API_TIMEOUT)
         data = response.json()
@@ -159,40 +129,33 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
 
 
 def main():
-    try:
-        application = Application.builder() \
-            .token(BOT_TOKEN) \
-            .read_timeout(API_TIMEOUT) \
-            .write_timeout(API_TIMEOUT) \
-            .connect_timeout(API_TIMEOUT) \
-            .pool_timeout(API_TIMEOUT) \
-            .get_updates_read_timeout(API_TIMEOUT) \
-            .post_init(post_init) \
-            .build()
+    application = Application.builder() \
+        .token(BOT_TOKEN) \
+        .read_timeout(API_TIMEOUT) \
+        .write_timeout(API_TIMEOUT) \
+        .connect_timeout(API_TIMEOUT) \
+        .pool_timeout(API_TIMEOUT) \
+        .get_updates_read_timeout(API_TIMEOUT) \
+        .build()
 
-        # گروپ ہینڈلر
-        application.add_handler(MessageHandler(
-            filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
-            handle_group_message
-        ))
+    application.add_handler(MessageHandler(
+        filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
+        handle_group_message
+    ))
 
-        # پرسنل میں /start
-        application.add_handler(CommandHandler("start", start_command, filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("start", start_command, filters.ChatType.PRIVATE))
 
-        # پرسنل نارمل چیٹ
-        application.add_handler(MessageHandler(
-            filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
-            handle_private_message
-        ))
+    application.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
+        handle_private_message
+    ))
 
-        print("Bot is starting...")
-        application.run_polling(
-            poll_interval=1.0,
-            timeout=API_TIMEOUT,
-            drop_pending_updates=True
-        )
-    except Exception as e:
-        print(f"Failed to start bot: {e}")
+    print("Bot is starting...")
+    application.run_polling(
+        poll_interval=1.0,
+        timeout=API_TIMEOUT,
+        drop_pending_updates=True
+    )
 
 if __name__ == '__main__':
     main()
