@@ -43,90 +43,14 @@ def analyze_illegal_message(text: str) -> bool:
     text_lower = text.lower()
     return any(k in text_lower for k in keywords)
 
-import aiohttp
-
-async def analyze_with_api(text: str):
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(API_URL, params={"prompt": text}, timeout=API_TIMEOUT) as resp:
-                data = await resp.json()
-                return data.get("status", False)
-        except Exception as e:
-            print("API error:", e)
-            return False
-
-# اسی طرح handle_private_message کے اندر بھی
-async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if not message:
-        return
-    text = message.text or ""
-    
-    # ... (باقی کوڈ)
-    
-    # اگر کمانڈ /setrules ہے
-    if text.startswith("/setrules"):
-        # فارمیٹ: /setrules @groupusername rules here...
-        parts = text.split(None, 2)
-        if len(parts) < 3:
-            await message.reply_text("Usage: /setrules @groupusername <rules>")
-            return
-
-        group_username = parts[1]
-        rules_text = parts[2]
-
-        # چیک کریں کہ @ لگا ہے
-        if not group_username.startswith("@"):
-            await message.reply_text("Please provide a valid group username starting with '@'")
-            return
-
-        try:
-            # یوزر نیم سے گروپ کی ڈیٹیل لیں
-            chat = await context.bot.get_chat(group_username)
-        except Exception as e:
-            await message.reply_text(f"Invalid group username: {group_username}")
-            return
-
-        # چیک کریں یوزر گروپ کا ایڈمن ہے
-        if not await is_user_admin(chat, message.from_user.id, context):
-            await message.reply_text("You must be an admin of the group to set rules.")
-            return
-
-        # چیک کریں بوٹ خود بھی گروپ کا ایڈمن ہے
-        if not await is_user_admin(chat, context.bot.id, context):
-            await message.reply_text("Bot must be admin in the group to save rules.")
-            return
-
-        # رولز سیو کریں (گروپ ID کی بنیاد پر)
-        save_rules(chat.id, {"rules": rules_text})
-        await message.reply_text(f"Rules saved for group {chat.title}.")
-
-        return  # یہاں ختم کر دیں تاکہ نیچے والا AI ریپلائی نہ دے
-
-    # ----- سکرپٹ ڈیٹیکشن -----
-    if "\n" in text and len(text.split("\n")) > 3 and any(sym in text for sym in ["{", "}", ";", "=", "(", ")"]):
-        try:
-            lang = detect(text)
-        except:
-            lang = "en"
-
-        if lang == "ur":
-            reply_text = "بھائی میں سکرپٹیں وغیرہ نہیں، صرف آپ سے بات چیت کر سکتا ہوں اور سوالوں کے جواب دے سکتا ہوں۔"
-        else:
-            reply_text = "I cannot process scripts. I can only chat with you and answer your questions."
-
-        await message.reply_text(reply_text)
-        return
-    
+def analyze_with_api(text: str):
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(API_URL, params={"prompt": text}, timeout=API_TIMEOUT) as resp:
-                data = await resp.json()
-                ai_reply = data.get("result", "I couldn't understand that.")
+        response = requests.get(API_URL, params={"prompt": text}, timeout=API_TIMEOUT)
+        data = response.json()
+        return data.get("status", False)
     except Exception as e:
-        ai_reply = f"Error: {e}"
-
-    await message.reply_text(ai_reply)
+        print("API error:", e)
+        return False
 
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -145,10 +69,10 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         # entities میں لنک یا مینشن چیک کریں
         for ent in message.entities or []:
             if ent.type in ['url', 'mention', 'text_mention']:
-                await message.reply_text("/mute", reply_to_message_id=message.message_id)
+                await message.reply_text("/action", reply_to_message_id=message.message_id)
                 return
         if message.forward_date:
-            await message.reply_text("/mute", reply_to_message_id=message.message_id)
+            await message.reply_text("/action", reply_to_message_id=message.message_id)
             return
 
     # باقی میسجز کا AI سے اینالائز کریں
@@ -158,7 +82,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if rules:
         # سادہ کی ورڈ چیک (آپ API call بھی لگا سکتے ہیں)
         if analyze_illegal_message(message.text or "") or analyze_with_api(message.text or ""):
-            await message.reply_text("/mute", reply_to_message_id=message.message_id)
+            await message.reply_text("/action", reply_to_message_id=message.message_id)
 
 async def post_init(application: Application):
     await application.bot.set_my_commands([
@@ -171,17 +95,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hello! I'm your AI board. Use /setrules to set group rules."
     )
-"""
+
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message:
         return
-        
+
     text = message.text or ""
 
-    # اگر کمانڈ /setrules ہے
+    # اگر کمانڈ ہے تو اسے الگ ہینڈل کریں
     if text.startswith("/setrules"):
-        # فارمیٹ: /setrules @groupusername rules here...
         parts = text.split(None, 2)
         if len(parts) < 3:
             await message.reply_text("Usage: /setrules @groupusername <rules>")
@@ -190,50 +113,41 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         group_username = parts[1]
         rules_text = parts[2]
 
-        # چیک کریں کہ @ لگا ہے
         if not group_username.startswith("@"):
             await message.reply_text("Please provide a valid group username starting with '@'")
             return
 
         try:
-            # یوزر نیم سے گروپ کی ڈیٹیل لیں
             chat = await context.bot.get_chat(group_username)
-        except Exception as e:
+        except Exception:
             await message.reply_text(f"Invalid group username: {group_username}")
             return
 
-        # چیک کریں یوزر گروپ کا ایڈمن ہے
         if not await is_user_admin(chat, message.from_user.id, context):
             await message.reply_text("You must be an admin of the group to set rules.")
             return
 
-        # چیک کریں بوٹ خود بھی گروپ کا ایڈمن ہے
         if not await is_user_admin(chat, context.bot.id, context):
             await message.reply_text("Bot must be admin in the group to save rules.")
             return
 
-        # رولز سیو کریں (گروپ ID کی بنیاد پر)
         save_rules(chat.id, {"rules": rules_text})
         await message.reply_text(f"Rules saved for group {chat.title}.")
-
-        return  # یہاں ختم کر دیں تاکہ نیچے والا AI ریپلائی نہ دے
-
-    # ----- سکرپٹ ڈیٹیکشن -----
-    if "\n" in text and len(text.split("\n")) > 3 and any(sym in text for sym in ["{", "}", ";", "=", "(", ")"]):
-        try:
-            lang = detect(text)
-        except:
-            lang = "en"
-
-        if lang == "ur":
-            reply_text = "بھائی میں سکرپٹیں وغیرہ نہیں، صرف آپ سے بات چیت کر سکتا ہوں اور سوالوں کے جواب دے سکتا ہوں۔"
-        else:
-            reply_text = "I cannot process scripts. I can only chat with you and answer your questions."
-
-        await message.reply_text(reply_text)
         return
 
-    # ----- باقی نارمل چیٹ -----
+    # اسکرپٹ یا بہت لمبا/مشکل ٹیکسٹ چیک کرنے سے پہلے، جو صرف عام چیٹ ہو
+    if "\n" in text and len(text.split("\n")) > 5:
+        # زیادہ ایموجیز یا خاص کریکٹر چیک (بس سیمپل چیک)
+        emoji_count = sum(1 for c in text if c in "😀😂🤣😍👍🙏👎😢😡😱🔥✨")  # اپنی مرضی کے ایموجی بڑھا سکتے ہو
+        if emoji_count > 10:
+            await message.reply_text("Your message contains too many emojis. Please send simpler text.")
+            return
+        # اگر لگتا ہے کہ یہ سکرپٹ یا پیچیدہ ہے تو ہلکا سا پیغام دیں
+        if any(sym in text for sym in ["{", "}", ";", "=", "(", ")"]):
+            await message.reply_text("I cannot process scripts or complex text. Please chat normally.")
+            return
+
+    # باقی نارمل چیٹ کا جواب AI سے لیں
     try:
         response = requests.get(API_URL, params={"prompt": text}, timeout=API_TIMEOUT)
         data = response.json()
@@ -242,7 +156,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         ai_reply = f"Error: {e}"
 
     await message.reply_text(ai_reply)
-"""
+
 
 def main():
     try:
