@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 channels = [
     {"name": "Black Hat", "link": "https://t.me/+2P-OUmWo1hc0NmNh"},
     {"name": "Impossible", "link": "https://t.me/only_possible_world", "id": "-1002650289632"},
+    {"name": "King Zarar", "link": "https://t.me/ZararEra"},
     {"name": "SYBER", "link": "https://t.me/CRACKEDEVER"}
 ]
 
