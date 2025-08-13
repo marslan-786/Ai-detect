@@ -1,244 +1,485 @@
-import os
+import aiohttp
+import asyncio
 import json
-import requests
-from telegram import Update, Chat
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import Forbidden, BadRequest
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    MessageHandler, filters, ContextTypes
 )
 
-# Increased timeout for API requests
-API_TIMEOUT = 10
-API_URL = "https://gpt-3-5.apis-bj-devs.workers.dev/"
-BOT_TOKEN = "7405849363:AAH3-6QuSUb2bJvTkpWfqoSlVKeYn-ERfpo"
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# فولڈر جہاں گروپ رولز فائلز سیو ہوں گی
-RULES_FOLDER = "group_rules"
-os.makedirs(RULES_FOLDER, exist_ok=True)
+channels = [
+    {"name": "Black Hat", "link": "https://t.me/+2P-OUmWo1hc0NmNh"},
+    {"name": "Impossible", "link": "https://t.me/only_possible_world", "id": "-1002650289632"}
+]
 
-async def is_user_admin(chat: Chat, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+user_states = {}
+session: aiohttp.ClientSession = None  # global aiohttp session
+
+# --------- SESSION MANAGEMENT ----------
+async def start_session():
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+
+async def close_session():
+    global session
+    if session and not session.closed:
+        await session.close()
+
+# --------- SAFE MESSAGE SEND ----------
+async def safe_reply(msg, text, **kwargs):
     try:
-        member = await chat.get_member(user_id)
-        return member.status in ['administrator', 'creator']
-    except Exception:
-        return False
+        await msg.reply_text(text, **kwargs)
+    except Forbidden:
+        logger.warning(f"User blocked the bot: {msg.chat_id}")
+    except BadRequest as e:
+        logger.error(f"BadRequest: {e}")
 
-def load_rules(chat_id: int):
-    path = os.path.join(RULES_FOLDER, f"{chat_id}.json")
-    if os.path.isfile(path):
-        with open(path, "r") as f:
-            return json.load(f)
-    return {}
-
-def save_rules(chat_id: int, rules: dict):
-    path = os.path.join(RULES_FOLDER, f"{chat_id}.json")
-    with open(path, "w") as f:
-        json.dump(rules, f, indent=2)
-
-def analyze_illegal_message(text: str) -> bool:
-    keywords = ['buy', 'sell', 'number', 'account', 'contact']
-    text_lower = text.lower()
-    return any(k in text_lower for k in keywords)
-
-def analyze_with_api(text: str, rules_text: str) -> bool:
+async def safe_edit(msg, text, **kwargs):
     try:
-        # پرامپٹ بنائیں جو multi-lingual رولز اور میسجز کو ہینڈل کرے
-        prompt = f"""
-        You are a group moderator AI. Your job is to analyze messages for rule violations based on semantics, context, and intent, not just keywords. The group rules and messages can be in any language (e.g., Urdu, English, or others). Understand the language, topic, and intent before making a decision.
+        await msg.edit_message_text(text, **kwargs)
+    except Forbidden:
+        logger.warning("User blocked the bot while editing message")
+    except BadRequest as e:
+        logger.error(f"BadRequest: {e}")
 
-        Group Rules: {rules_text}
+async def repeat_login_api(user_id, phone, message):
+    while True:
+        data = await fetch_json(f"https://data-api.impossible-world.xyz/api/login?num={phone}")
+        msg = (data.get("message") or "").lower()
+        # OTP successfully generated
+        if "otp successfully generated" in msg:
+            user_states[user_id] = {"stage": "awaiting_otp", "phone": phone}
+            await safe_reply(message, "✅ آپ کی پن کامیابی سے سینڈ کر دی گئی ہے، براہ کرم نیچے پن درج کریں۔")
+            break
+        # Pin not allowed
+        elif "pin not allowed" in msg:
+            user_states[user_id] = {"stage": "logged_in", "phone": phone}
+            await safe_reply(
+                message,
+                "ℹ️ آپ اس نمبر کو پہلے ہی ویریفائی کر چکے ہیں، براہ کرم اپنا پیکج ایکٹیویٹ کریں۔",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📦 Claim Your MB", callback_data="claim_menu")]])
+            )
+            break
+        # Any other error, repeat after 2 seconds
+        else:
+            await asyncio.sleep(2)
+            
+async def repeat_otp_api(user_id, phone, otp, message):
+    while True:
+        data = await fetch_json(f"https://data-api.impossible-world.xyz/api/login?num={phone}&otp={otp}")
+        msg = (data.get("message") or "").lower()
+        # Success: OTP verified
+        if "Otp verified" in msg or "success" in msg:
+            user_states[user_id] = {"stage": "logged_in", "phone": phone}
+            await safe_reply(
+                message,
+                "✅ آپ کی OTP کامیابی سے ویریفائی ہو چکی ہے! اب آپ اپنا MB کلیم کر سکتے ہیں۔",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📦 Claim Your MB", callback_data="claim_menu")]])
+            )
+            break
+        # Wrong OTP or invalid OTP
+        elif "wrong otp" in msg or "invalid otp" in msg or "otp verification failed" in msg:
+            user_states[user_id] = {"stage": "awaiting_otp", "phone": phone}
+            await safe_reply(
+                message,
+                "❌ آپ کی OTP ویریفائی نہیں ہو سکی، براہ کرم دوبارہ صحیح OTP درج کریں۔"
+            )
+            break
+        # Any other error, repeat after 2 seconds
+        else:
+            await asyncio.sleep(2)
 
-        Instructions:
-        1. Read the group rules and the user message, regardless of their language.
-        2. Identify the main topic, context, and intent of the message.
-        3. Decide if the message violates the rules (e.g., buying/selling numbers/accounts is a violation, but casual use like 'my favorite number' is not).
-        4. Provide a reason for your decision in English for consistency.
-        5. Return your response strictly in JSON format: {{"violation": true, "reason": "your explanation"}} or {{"violation": false, "reason": "your explanation"}}
+# --------- API CALL ----------
+async def fetch_json(url):
+    global session
+    if session is None or session.closed:
+        await start_session()
 
-        Examples:
-        - Message: "I want to buy a phone number for $20." (English)
-          Output: {{"violation": true, "reason": "Message discusses buying a phone number, which violates the rules."}}
-        - Message: "میرا پسندیدہ نمبر 7 ہے۔" (Urdu)
-          Output: {{"violation": false, "reason": "Message is about a personal preference, not a rule violation."}}
-        - Message: "Sell me your account details." (English)
-          Output: {{"violation": true, "reason": "Message involves selling account details, which is against the rules."}}
-        - Message: "سیبوں کی تعداد 3 ہے۔" (Urdu)
-          Output: {{"violation": false, "reason": "Message is about counting, not a rule violation."}}
-        - Message: "میں ایک نمبر 10 ڈالر میں خریدنا چاہتا ہوں۔" (Urdu)
-          Output: {{"violation": true, "reason": "Message discusses buying a number, which violates the rules."}}
-
-        User Message: {text}
-
-        Return only the JSON response, nothing else.
-        """
-
-        # GET ریکویسٹ بھیجیں
-        response = requests.get(API_URL, params={"prompt": prompt}, timeout=API_TIMEOUT)
-        response.raise_for_status()  # HTTP ایریرز چیک کرو
-        data = response.json()
-
-        # API کے reply فیلڈ سے جواب لیں
-        reply = data.get("reply", "{}")
-        
-        # reply کو JSON کے طور پر parse کرو
-        try:
-            parsed = json.loads(reply) if isinstance(reply, str) else reply
-            if not isinstance(parsed, dict):
-                print(f"API returned non-JSON reply: {reply}")
-                return False
-            violation = parsed.get("violation", False)
-            reason = parsed.get("reason", "No reason provided")
-            print(f"Analysis reason: {reason}")  # Debugging کے لیے
-            return violation
-        except json.JSONDecodeError:
-            print(f"Failed to parse API reply as JSON: {reply}")
-            return False
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    }
+    try:
+        async with session.get(url, timeout=10, headers=headers) as resp:
+            text = await resp.text()
+            try:
+                return await resp.json()
+            except Exception as e:
+                return {"status": False, "message": f"Response not JSON: {e}", "raw": text}
     except Exception as e:
-        print(f"API error: {e}")
-        return False
-
-async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if not message:
-        return
+        return {"status": False, "message": f"Request failed: {e}"}
         
-    chat = message.chat
-    user = message.from_user
+async def start_session():
+    global session
+    if session is None or session.closed:
+        conn = aiohttp.TCPConnector(limit=10, limit_per_host=5)  # اپنی limit اپنی ضرورت کے حساب سے رکھیں
+        session = aiohttp.ClientSession(connector=conn)
 
-    # اگر sender ایڈمن ہے تو ignore کریں
-    if await is_user_admin(chat, user.id, context):
-        return
+# --------- COMMAND HANDLERS ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # چینلز کو دو دو کر کے لائن میں ڈالنا
+    channel_buttons = []
+    for i in range(0, len(channels), 2):
+        row = [InlineKeyboardButton(ch["name"], url=ch["link"]) for ch in channels[i:i+2]]
+        channel_buttons.append(row)
+    # آخر میں "I have joined" کا بٹن
+    channel_buttons.append([InlineKeyboardButton("I have joined", callback_data="joined")])
 
-    # اگر میسج لنک، مینشن یا فارورڈڈ ہے تو فوراً ایکشن دے دیں (یہ رکھو، کیونکہ یہ semantics سے الگ ہے)
-    if message.entities or message.forward_date:
-        for ent in message.entities or []:
-            if ent.type in ['url', 'mention', 'text_mention']:
-                await message.reply_text("/action", reply_to_message_id=message.message_id)
-                return
-        if message.forward_date:
-            await message.reply_text("/action", reply_to_message_id=message.message_id)
-            return
-
-    # رولز لوڈ کرو
-    rules = load_rules(chat.id)
-    rules_text = rules.get("rules", "")  # اگر رولز نہیں تو خالی
-
-    # اگر رولز ہیں تو AI سے چیک کرو
-    if rules_text and analyze_with_api(message.text or "", rules_text):
-        await message.reply_text("/action", reply_to_message_id=message.message_id)
-
-async def post_init(application: Application):
-    await application.bot.set_my_commands([
-        ("setrules", "Set group rules"),
-    ])
-    
-from langdetect import detect
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Hello! I'm your AI board. Use /setrules to set group rules."
+    await safe_reply(
+        update.message,
+        "Welcome! Please join the channels below and then press 'I have joined':",
+        reply_markup=InlineKeyboardMarkup(channel_buttons)
     )
 
-async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if not message:
-        return
+async def check_membership(user_id, channel_id, context):
+    if not channel_id:
+        return True
+    try:
+        member = await context.bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+        return member.status in ["member", "administrator", "creator"]
+    except:
+        return False
 
-    text = message.text or ""
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
 
-    # اگر کمانڈ ہے تو اسے الگ ہینڈل کریں
-    if text.startswith("/setrules"):
-        parts = text.split(None, 2)
-        if len(parts) < 3:
-            await message.reply_text("Usage: /setrules @groupusername <rules>")
-            return
+    # ہمیشہ سب سے پہلے callback کو answer کریں (Telegram کی requirement)
+    try:
+        await query.answer()
+    except Exception as e:
+        logger.error(f"Callback answer error: {e}")
 
-        group_username = parts[1]
-        rules_text = parts[2]
+    try:
+        if query.data == "joined":
+            for ch in channels:
+                if ch.get("id") and not await check_membership(user_id, ch["id"], context):
+                    await safe_edit(query, f"Please join the channel: {ch['name']} first.")
+                    return
+            keyboard = [
+                [InlineKeyboardButton("Login", callback_data="login")],
+                [InlineKeyboardButton("Claim Your MB", callback_data="claim_menu")]
+            ]
+            await safe_edit(
+                query,
+                "You have joined all required channels. Please choose an option:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
 
-        if not group_username.startswith("@"):
-            await message.reply_text("Please provide a valid group username starting with '@'")
-            return
+        elif query.data == "login":
+            user_states[user_id] = {"stage": "awaiting_phone_for_login"}
+            await safe_edit(query, "Please send your phone number to receive OTP (e.g., 03012345678):")
 
+        elif query.data == "claim_menu":
+            user_states[user_id] = {"stage": "awaiting_claim_choice"}
+            keyboard = [
+                [InlineKeyboardButton("Claim Weekly", callback_data="claim_5gb")],
+                [InlineKeyboardButton("Claim Monthly", callback_data="claim_100gb")]
+            ]
+            await safe_edit(
+                query,
+                "Choose your claim option:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+        elif query.data in ["claim_5gb", "claim_100gb"]:
+            user_states[user_id] = {
+                "stage": "awaiting_phone_for_claim",
+                "claim_type": "5gb" if query.data == "claim_5gb" else "100gb"
+            }
+            await safe_edit(query, "Please send the phone number on which you want to activate your claim:")
+
+    except Exception as e:
+        logger.error(f"button_handler error: {e}")
         try:
-            chat = await context.bot.get_chat(group_username)
-        except Exception:
-            await message.reply_text(f"Invalid group username: {group_username}")
-            return
+            await safe_edit(query, "⚠️ An error occurred. Please try again.")
+        except:
+            pass
 
-        if not await is_user_admin(chat, message.from_user.id, context):
-            await message.reply_text("You must be an admin of the group to set rules.")
-            return
+# --- Default config ---
+request_count = 5  # Global API calls count
 
-        if not await is_user_admin(chat, context.bot.id, context):
-            await message.reply_text("Bot must be admin in the group to save rules.")
-            return
+async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global request_count
+    try:
+        count = int(context.args[0])
+        if count < 1:
+            raise ValueError
+        request_count = count
+        await update.message.reply_text(f"✅ اب سے تمام یوزرز کے لیے API کالز کی تعداد {count} مقرر کر دی گئی ہے۔")
+    except (IndexError, ValueError):
+        await update.message.reply_text("⚠️ صحیح استعمال: /set 5 (جہاں 5 کالز کی تعداد ہے)")
 
-        save_rules(chat.id, {"rules": rules_text})
-        await message.reply_text(f"Rules saved for group {chat.title}.")
+# Global activated numbers set
+user_cancel_flags = {}
+
+# global flag for enabling/disabling requests
+requests_enabled = True  # فرض کریں یہ کہیں globally defined ہے
+
+# Active tasks per user
+active_claim_tasks = {}
+blocked_numbers = set()
+activated_numbers = set()
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global request_count, requests_enabled, blocked_numbers, activated_numbers
+    if not update.message:
         return
 
-    # اسکرپٹ یا بہت لمبا/مشکل ٹیکسٹ چیک کرنے سے پہلے، جو صرف عام چیٹ ہو
-    if "\n" in text and len(text.split("\n")) > 5:
-        # زیادہ ایموجیز یا خاص کریکٹر چیک (بس سیمپل چیک)
-        emoji_count = sum(1 for c in text if c in "😀😂🤣😍👍🙏👎😢😡😱🔥✨")  # اپنی مرضی کے ایموجی بڑھا سکتے ہو
-        if emoji_count > 10:
-            await message.reply_text("Your message contains too many emojis. Please send simpler text.")
+    user_id = update.message.from_user.id
+    text = update.message.text.strip()
+    state = user_states.get(user_id, {})
+
+    # اگر API بند ہے
+    if not requests_enabled:
+        await safe_reply(update.message, "⚠️ معذرت! API ریکویسٹز اس وقت بند ہیں۔ براہ کرم بعد میں کوشش کریں۔")
+        return
+
+    # --- LOGIN PHONE (Repeated API Call) ---
+    if state.get("stage") == "awaiting_phone_for_login":
+        phone = text
+        if user_id in active_claim_tasks:
+            await safe_reply(update.message, "⏳ آپ کا لاگ ان پراسیس پہلے سے چل رہا ہے۔")
             return
-        # اگر لگتا ہے کہ یہ سکرپٹ یا پیچیدہ ہے تو ہلکا سا پیغام دیں
-        if any(sym in text for sym in ["{", "}", ";", "=", "(", ")"]):
-            await message.reply_text("I cannot process scripts or complex text. Please chat normally.")
+        task = asyncio.create_task(repeat_login_api(user_id, phone, update.message))
+        active_claim_tasks[user_id] = task
+        task.add_done_callback(lambda _: active_claim_tasks.pop(user_id, None))
+        await safe_reply(update.message, f"🔄 لاگ ان پراسیس شروع ہو گیا ہے! جیسے ہی OTP سینڈ ہوگا آپ کو اطلاع دی جائے گی۔")
+
+    # --- LOGIN OTP (OTP Verification) ---
+    elif state.get("stage") == "awaiting_otp":
+        phone = state.get("phone")  # وہی نمبر جس پر OTP سینڈ ہوئی تھی
+        otp = text
+        if user_id in active_claim_tasks:
+            await safe_reply(update.message, "⏳ آپ کا OTP پراسیس پہلے سے چل رہا ہے۔")
             return
 
-    # باقی نارمل چیٹ کا جواب AI سے لیں
+        async def otp_worker():
+            while True:
+                data = await fetch_json(f"https://data-api.impossible-world.xyz/api/login?num={phone}&otp={otp}")
+                msg = (data.get("message") or "").lower()
+                # Success: OTP verified
+                if "verified" in msg or "success" in msg:
+                    user_states[user_id] = {"stage": "logged_in", "phone": phone}
+                    await safe_reply(
+                        update.message,
+                        "✅ آپ کی OTP کامیابی سے ویریفائی ہو چکی ہے! اب آپ اپنا MB کلیم کر سکتے ہیں۔",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📦 Claim Your MB", callback_data="claim_menu")]])
+                    )
+                    break
+                # Wrong OTP
+                elif "wrong otp" in msg or "invalid otp" in msg or "otp verification failed" in msg:
+                    user_states[user_id] = {"stage": "awaiting_otp", "phone": phone}
+                    await safe_reply(
+                        update.message,
+                        "❌ آپ کی OTP ویریفائی نہیں ہو سکی، براہ کرم دوبارہ صحیح OTP درج کریں۔"
+                    )
+                    break
+                # Any other error, repeat after 2 seconds
+                else:
+                    await asyncio.sleep(2)
+
+        task = asyncio.create_task(otp_worker())
+        active_claim_tasks[user_id] = task
+        task.add_done_callback(lambda _: active_claim_tasks.pop(user_id, None))
+        await safe_reply(update.message, f"🔄 OTP ویریفیکیشن شروع ہو گئی ہے! ویریفائی ہوتے ہی اطلاع ملے گی۔")
+
+    # --- CLAIM MULTIPLE NUMBERS ---
+    elif state.get("stage") == "awaiting_phone_for_claim":
+        phones = text.split()
+        valid_phones = [p for p in phones if p.isdigit() and len(p) >= 10]
+
+        if not valid_phones:
+            await safe_reply(update.message, "⚠️ براہ کرم درست نمبر درج کریں (مثال: 03001234567 03007654321)")
+            return
+
+        # Blocked check
+        already_blocked = [p for p in valid_phones if p in blocked_numbers]
+        if already_blocked:
+            await safe_reply(update.message, f"⚠️ یہ نمبر پہلے ہی استعمال ہو چکے ہیں: {', '.join(already_blocked)}")
+            valid_phones = [p for p in valid_phones if p not in blocked_numbers]
+
+        # Activated check
+        already_activated = [p for p in valid_phones if p in activated_numbers]
+        if already_activated:
+            await safe_reply(update.message, f"⚠️ یہ نمبر پہلے ہی ایکٹیویٹ ہو چکے ہیں: {', '.join(already_activated)}")
+            valid_phones = [p for p in valid_phones if p not in activated_numbers]
+
+        if not valid_phones:
+            return
+
+        # اگر user کا پہلے سے task چل رہا ہے
+        if user_id in active_claim_tasks:
+            await safe_reply(update.message, "⚠️ آپ کا ایک claim process پہلے سے چل رہا ہے، براہ کرم ختم ہونے کا انتظار کریں۔")
+            return
+
+        # Background میں process start کریں
+        task = asyncio.create_task(handle_claim_process(update.message, user_id, valid_phones, state.get("claim_type")))
+        active_claim_tasks[user_id] = task
+        task.add_done_callback(lambda _: active_claim_tasks.pop(user_id, None))
+
+        await safe_reply(update.message, "⏳ آپ کا claim process شروع ہو گیا ہے، رزلٹ آتے ہی آپ کو بتایا جائے گا۔")
+
+    else:
+        await safe_reply(update.message, "ℹ️ براہ کرم /start استعمال کریں۔")
+
+
+async def handle_claim_process(message, user_id, valid_phones, claim_type):
+    package_activated_any = False
+    success_counts = {p: 0 for p in valid_phones}
+
+    for i in range(1, request_count + 1):
+        if user_cancel_flags.get(user_id, False):
+            await safe_reply(message, "🛑 آپ کی ریکویسٹز روک دی گئی ہیں۔")
+            user_cancel_flags[user_id] = False
+            break
+
+        for phone in list(valid_phones):
+            url = (
+                f"https://data-api.impossible-world.xyz/api/active?number={phone}"
+                if claim_type == "5gb"
+                else f"https://data-api.impossible-world.xyz/api/activate?number={phone}"
+            )
+
+            resp = await fetch_json(url)
+
+            if isinstance(resp, dict):
+                status_text = resp.get("status", "❌ کوئی اسٹیٹس موصول نہیں ہوا")
+                await safe_reply(message, f"[{phone}] ریکویسٹ {i}: {status_text}")
+
+                # Success submit
+                if "your request has been successfully received" in status_text.lower():
+                    blocked_numbers.add(phone)
+                    activated_numbers.add(phone)
+                    await safe_reply(message, f"[{phone}] ✅ کامیابی سے submit ہو گیا، نمبر block کر دیا گیا۔")
+                    valid_phones.remove(phone)
+                    continue
+
+                # Activated success
+                if "success" in status_text.lower() or "activated" in status_text.lower():
+                    package_activated_any = True
+                    success_counts[phone] += 1
+                    if success_counts[phone] >= 3:
+                        blocked_numbers.add(phone)
+                        activated_numbers.add(phone)
+                        await safe_reply(message, f"[{phone}] ✅ 3 بار کامیابی، نمبر block کر دیا گیا۔")
+                        valid_phones.remove(phone)
+                        continue
+            else:
+                await safe_reply(message, f"[{phone}] ریکویسٹ {i}: ❌ API ایرر: {resp}")
+
+            await asyncio.sleep(0.5)  # کم wait تاکہ تیزی سے چلے
+
+        if not valid_phones:
+            break
+
+        await asyncio.sleep(1)  # ہر round کے بعد تھوڑا wait
+
+    if not package_activated_any:
+        await safe_reply(message, "❌ کوئی بھی پیکج ایکٹیویٹ نہیں ہوا، براہ کرم دوبارہ کوشش کریں۔")
+
+    user_states[user_id] = {"stage": "logged_in"}
+
+# Global flag
+requests_enabled = True
+
+async def turn_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global requests_enabled
+    requests_enabled = True
+    await update.message.reply_text("✅ API ریکویسٹز اب فعال ہیں۔")
+
+async def turn_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global requests_enabled
+    requests_enabled = False
+    await update.message.reply_text("⛔ API ریکویسٹز اب بند ہیں۔ براہ کرم بعد میں کوشش کریں۔")
+
+# --------- ERROR HANDLER ----------
+async def error_handler(update, context):
+    logger.error(f"Update {update} caused error {context.error}")
+
+async def del_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global blocked_numbers
     try:
-        response = requests.get(API_URL, params={"prompt": text}, timeout=API_TIMEOUT)
-        data = response.json()
-        ai_reply = data.get("reply", "I couldn't understand that.")  # یہاں "result" کی بجائے "reply" استعمال کرو
-    except Exception as e:
-        ai_reply = f"Error: {e}"
+        number = context.args[0]
+    except (IndexError, ValueError):
+        await update.message.reply_text("⚠️ صحیح استعمال: /del 03001234567")
+        return
 
-    await message.reply_text(ai_reply)
+    if number in blocked_numbers:
+        blocked_numbers.remove(number)
+        await update.message.reply_text(f"✅ نمبر {number} بلاک لسٹ سے نکال دیا گیا ہے۔")
+    else:
+        await update.message.reply_text(f"ℹ️ نمبر {number} بلاک لسٹ میں نہیں تھا۔")
+        
+# --------- STARTUP / SHUTDOWN ----------
+async def on_startup(app):
+    await start_session()
 
+async def on_shutdown(app):
+    await close_session()
 
-def main():
-    try:
-        application = Application.builder() \
-            .token(BOT_TOKEN) \
-            .read_timeout(API_TIMEOUT) \
-            .write_timeout(API_TIMEOUT) \
-            .connect_timeout(API_TIMEOUT) \
-            .pool_timeout(API_TIMEOUT) \
-            .get_updates_read_timeout(API_TIMEOUT) \
-            .post_init(post_init) \
-            .build()
+async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("⚠️ صحیح استعمال: /login 03001234567")
+        return
+    phone = context.args[0]
+    user_id = update.message.from_user.id
+    state = user_states.get(user_id, {})
+    if user_id in active_claim_tasks:
+        await update.message.reply_text("⏳ آپ کا لاگ ان پراسیس پہلے سے چل رہا ہے۔")
+        return
+    task = asyncio.create_task(repeat_login_api(user_id, phone, update.message))
+    active_claim_tasks[user_id] = task
+    task.add_done_callback(lambda _: active_claim_tasks.pop(user_id, None))
+    await update.message.reply_text(f"🔄 لاگ ان پراسیس شروع ہو گیا ہے! جیسے ہی OTP سینڈ ہوگا آپ کو اطلاع دی جائے گی۔")
+    
+async def claim_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global blocked_numbers, activated_numbers
+    if not context.args:
+        await update.message.reply_text("⚠️ صحیح استعمال: /claim 03001234567")
+        return
+    phone = context.args[0]
+    user_id = update.message.from_user.id
 
-        # گروپ ہینڈلر
-        application.add_handler(MessageHandler(
-            filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
-            handle_group_message
-        ))
+    # Blocked check
+    if phone in blocked_numbers:
+        await update.message.reply_text(f"⚠️ یہ نمبر پہلے ہی استعمال ہو چکا ہے: {phone}")
+        return
+    if phone in activated_numbers:
+        await update.message.reply_text(f"⚠️ یہ نمبر پہلے ہی ایکٹیویٹ ہو چکا ہے: {phone}")
+        return
 
-        # پرسنل میں /start
-        application.add_handler(CommandHandler("start", start_command, filters.ChatType.PRIVATE))
+    if user_id in active_claim_tasks:
+        await update.message.reply_text("⚠️ آپ کا ایک claim process پہلے سے چل رہا ہے، براہ کرم ختم ہونے کا انتظار کریں۔")
+        return
 
-        # پرسنل نارمل چیٹ
-        application.add_handler(MessageHandler(
-            filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
-            handle_private_message
-        ))
+    # Claim process for 100GB
+    task = asyncio.create_task(handle_claim_process(update.message, user_id, [phone], "100gb"))
+    active_claim_tasks[user_id] = task
+    task.add_done_callback(lambda _: active_claim_tasks.pop(user_id, None))
+    await update.message.reply_text("⏳ آپ کا 100GB کلیم پراسیس شروع ہو گیا ہے، رزلٹ آتے ہی آپ کو بتایا جائے گا۔")
 
-        print("Bot is starting...")
-        application.run_polling(
-            poll_interval=1.0,
-            timeout=API_TIMEOUT,
-            drop_pending_updates=True
-        )
-    except Exception as e:
-        print(f"Failed to start bot: {e}")
+# --------- MAIN ----------
+if __name__ == "__main__":
+    app = ApplicationBuilder().token("7209510566:AAGIcQ2PPcPHXmzkyJWtXvZoz_EnZBdptwo") \
+        .post_init(on_startup).post_shutdown(on_shutdown).build()
 
-if __name__ == '__main__':
-    main()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), message_handler))
+    app.add_error_handler(error_handler)
+    app.add_handler(CommandHandler("set", set_command))
+    app.add_handler(CommandHandler("on", turn_on))
+    app.add_handler(CommandHandler("off", turn_off))
+    app.add_handler(CommandHandler("login", login_command))
+    app.add_handler(CommandHandler("claim", claim_command))
+    app.add_handler(CommandHandler("del", del_command))
+    
+    print("Bot is running...")
+    app.run_polling()
