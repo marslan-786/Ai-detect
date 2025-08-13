@@ -383,7 +383,7 @@ async def handle_claim_process(message, user_id, valid_phones, claim_type):
         await asyncio.sleep(1)  # ہر round کے بعد تھوڑا wait
 
     if not package_activated_any:
-        await safe_reply(message, "❌ کوئی بھی پیکج ایکٹیویٹ نہیں ہوا، براہ کرم دوبارہ کوشش کریں۔")
+        await safe_reply(message, "Thanks for using my bot")
 
     user_states[user_id] = {"stage": "logged_in"}
 
