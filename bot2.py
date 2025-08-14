@@ -16,7 +16,9 @@ logger = logging.getLogger(__name__)
 channels = [
     {"name": "Sigma 👿", "link": "https://t.me/HunterXSigma"},
     {"name": "Sigma Discuss", "link": "https://t.me/SigmaXDiscus"},
-    {"name": "Impossible", "link": "https://t.me/only_possible_world", "id": "-1002650289632"}
+    {"name": "Impossible", "link": "https://t.me/only_possible_world", "id": "-1002650289632"},
+    {"name": "SYBER", "link": "https://t.me/CRACKEDEVER"},
+    {"name": "HAT", "link": "https://t.me/dinesty_hat"}
 ]
 
 user_states = {}
