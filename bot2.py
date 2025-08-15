@@ -19,7 +19,8 @@ channels = [
     {"name": "Impossible", "link": "https://t.me/only_possible_world", "id": "-1002650289632"},
     {"name": "SYBER", "link": "https://t.me/CRACKEDEVER"},
     {"name": "HAT", "link": "https://t.me/dinesty_hat"},
-    {"name": "JND TECH", "link": "https://t.me/jndtech1"}
+    {"name": "JND TECH", "link": "https://t.me/jndtech1"},
+    {"name": "Add Me", "link": "https://https://t.me/addlist/nBrpiBlyM_FmODQ8"}
 ]
 
 user_states = {}
